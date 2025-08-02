@@ -1,6 +1,8 @@
 module github.com/olivierboudet/cert-manager-alidns-webhook
 
-go 1.24.2
+go 1.24.0
+
+toolchain go1.24.2
 
 require (
 	github.com/alibabacloud-go/alidns-20150109 v1.0.3
