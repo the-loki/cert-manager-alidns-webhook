@@ -4,12 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk"
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/auth/credentials"
-	"github.com/aliyun/alibaba-cloud-sdk-go/sdk/requests"
-	"github.com/aliyun/alibaba-cloud-sdk-go/services/alidns"
-
+	alidns "github.com/alibabacloud-go/alidns-20150109/client"
+	aliopenapi "github.com/alibabacloud-go/darabonba-openapi/client"
+	teaUtil "github.com/alibabacloud-go/tea-utils/service"
 	"os"
 	"strings"
 
@@ -54,8 +51,9 @@ type aliDNSProviderSolver struct {
 	// 3. uncomment the relevant code in the Initialize method below
 	// 4. ensure your webhook's service account has the required RBAC role
 	//    assigned to it for interacting with the Kubernetes APIs you need.
-	client       *kubernetes.Clientset
-	aliDNSClient *alidns.Client
+	client         *kubernetes.Clientset
+	dnsClient      *alidns.Client
+	runtimeOptions *teaUtil.RuntimeOptions
 }
 
 // customDNSProviderConfig is a structure that is used to decode into when
@@ -116,14 +114,26 @@ func (c *aliDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return err
 	}
 
-	conf := sdk.NewConfig()
-	credential := credentials.NewAccessKeyCredential(string(accessToken), string(secretKey))
+	clientConfig := new(aliopenapi.Config)
+	clientConfig.SetAccessKeyId(string(accessToken)).
+		SetAccessKeySecret(string(secretKey)).
+		SetRegionId(cfg.Regionid).
+		SetConnectTimeout(5000).
+		SetReadTimeout(10000)
 
-	client, err := alidns.NewClientWithOptions(cfg.Regionid, conf, credential)
+	client, err := alidns.NewClient(clientConfig)
 	if err != nil {
-		return err
+		return fmt.Errorf("alicloud: error with create client: %v", err)
 	}
-	c.aliDNSClient = client
+
+	runtimeOptions := new(teaUtil.RuntimeOptions).
+		SetAutoretry(false).
+		SetMaxIdleConns(3).
+		SetReadTimeout(5000).
+		SetConnectTimeout(10000)
+
+	c.dnsClient = client
+	c.runtimeOptions = runtimeOptions
 
 	zoneName, err := c.getHostedZone(ch.ResolvedZone)
 	if err != nil {
@@ -132,7 +142,7 @@ func (c *aliDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 
 	recordAttributes := c.newTxtRecord(zoneName, ch.ResolvedFQDN, ch.Key)
 
-	_, err = c.aliDNSClient.AddDomainRecord(recordAttributes)
+	_, err = c.dnsClient.AddDomainRecord(recordAttributes)
 	if err != nil {
 		return fmt.Errorf("alicloud: error adding domain record: %v", err)
 	}
@@ -157,10 +167,10 @@ func (c *aliDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	}
 
 	for _, rec := range records {
-		if ch.Key == rec.Value {
-			request := alidns.CreateDeleteDomainRecordRequest()
+		if ch.Key == *rec.Value {
+			request := alidns.DeleteDomainRecordRequest{}
 			request.RecordId = rec.RecordId
-			_, err = c.aliDNSClient.DeleteDomainRecord(request)
+			_, err = c.dnsClient.DeleteDomainRecord(&request)
 			if err != nil {
 				return fmt.Errorf("alicloud: error deleting domain record: %v", err)
 			}
@@ -205,24 +215,35 @@ func loadConfig(cfgJSON *extapi.JSON) (aliDNSProviderConfig, error) {
 }
 
 func (c *aliDNSProviderSolver) getHostedZone(resolvedZone string) (string, error) {
-	request := alidns.CreateDescribeDomainsRequest()
+	request := alidns.DescribeDomainsRequest{}
 
 	var domains []string
-	startPage := 1
+	var startPage int64
+	startPage = 1
+
+	keyword := util.UnFqdn(resolvedZone)
 
 	for {
-		request.PageNumber = requests.NewInteger(startPage)
+		request.KeyWord = &keyword
+		request.PageNumber = &startPage
 
-		response, err := c.aliDNSClient.DescribeDomains(request)
+		response, err := c.dnsClient.DescribeDomains(&request)
 		if err != nil {
 			return "", fmt.Errorf("alicloud: error describing domains: %v", err)
 		}
 
-		for _, domain := range response.Domains.Domain {
-			domains = append(domains, domain.DomainName)
+		if response.Body == nil {
+			return "", fmt.Errorf("alicloud: error describing domains: no response body")
 		}
 
-		if response.PageNumber*response.PageSize >= response.TotalCount {
+		for _, domain := range response.Body.Domains.Domain {
+			domains = append(domains, *domain.DomainName)
+		}
+
+		pageSize := *response.Body.PageSize
+		pageNumber := *response.Body.PageNumber
+
+		if pageSize*pageNumber >= *response.Body.TotalCount {
 			break
 		}
 
@@ -243,35 +264,42 @@ func (c *aliDNSProviderSolver) getHostedZone(resolvedZone string) (string, error
 }
 
 func (c *aliDNSProviderSolver) newTxtRecord(zone, fqdn, value string) *alidns.AddDomainRecordRequest {
-	request := alidns.CreateAddDomainRecordRequest()
-	request.Type = "TXT"
-	request.DomainName = zone
-	request.RR = c.extractRecordName(fqdn, zone)
-	request.Value = value
-	return request
+	request := alidns.AddDomainRecordRequest{}
+	recordType := "TXT"
+	recordName := c.extractRecordName(fqdn, zone)
+
+	request.Type = &recordType
+	request.DomainName = &zone
+	request.RR = &recordName
+	request.Value = &value
+
+	return &request
 }
 
-func (c *aliDNSProviderSolver) findTxtRecords(domain string, fqdn string) ([]alidns.Record, error) {
+func (c *aliDNSProviderSolver) findTxtRecords(domain string, fqdn string) ([]alidns.DescribeDomainRecordsResponseBodyDomainRecordsRecord, error) {
 	zoneName, err := c.getHostedZone(domain)
 	if err != nil {
 		return nil, err
 	}
 
-	request := alidns.CreateDescribeDomainRecordsRequest()
-	request.DomainName = zoneName
-	request.PageSize = requests.NewInteger(500)
+	request := alidns.DescribeDomainRecordsRequest{}
+	request.DomainName = &zoneName
+	var pageSize int64
+	pageSize = 500
 
-	var records []alidns.Record
+	request.PageSize = &pageSize
 
-	result, err := c.aliDNSClient.DescribeDomainRecords(request)
+	var records []alidns.DescribeDomainRecordsResponseBodyDomainRecordsRecord
+
+	result, err := c.dnsClient.DescribeDomainRecords(&request)
 	if err != nil {
 		return records, fmt.Errorf("alicloud: error describing domain records: %v", err)
 	}
 
 	recordName := c.extractRecordName(fqdn, zoneName)
-	for _, record := range result.DomainRecords.Record {
-		if record.RR == recordName {
-			records = append(records, record)
+	for _, record := range result.Body.DomainRecords.Record {
+		if *record.RR == recordName {
+			records = append(records, *record)
 		}
 	}
 	return records, nil
