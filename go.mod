@@ -1,4 +1,4 @@
-module github.com/olivierboudet/cert-manager-alidns-webhook
+module github.com/the-loki/cert-manager-alidns-webhook
 
 go 1.24.2
 
