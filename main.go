@@ -265,6 +265,7 @@ func (c *aliDNSProviderSolver) getHostedZone(resolvedZone string) (string, error
 
 func (c *aliDNSProviderSolver) newTxtRecord(zone, fqdn, value string) *alidns.AddDomainRecordRequest {
 	request := alidns.AddDomainRecordRequest{}
+
 	recordType := "TXT"
 	recordName := c.extractRecordName(fqdn, zone)
 
